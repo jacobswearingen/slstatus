@@ -69,11 +69,12 @@ static const char unknown_str[] = "n/a";
  */
 static const struct arg args[] = {
 	/* function format          argument */
-	{datetime, "%s", "%F | %T | "},
+	{datetime, "%s", "%F |%T |"},
 	/* To get audio sink IDs/names, run `wpctl status`, `pactl list sinks`, or an analog */
 	{vol_mute, "%s ", "@DEFAULT_SINK@"},
-	{vol_perc, "%s%% | ", "@DEFAULT_SINK@"},
-	{ram_perc, "RAM %s%% | ", NULL},
-	{cpu_perc, "CPU %s%% | ", NULL},
-	{battery_perc, "BAT %s%% | ", "BAT0"},
+	{vol_perc, "%s%% |", "@DEFAULT_SINK@"},
+	/* {ram_perc, "RAM %s%% |", NULL}, */
+	{cpu_perc, "CPU %s%% |", NULL},
+	{battery_perc, "BAT %s%% |", "BAT0"},
+	{wifi_perc, "WLAN %s%%", "wlan0"},
 };
