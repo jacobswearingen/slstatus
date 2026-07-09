@@ -1,19 +1,32 @@
-
 #include <stdio.h>
+#include <string.h>
 #include <pulse/pulseaudio.h>
 
 // --- Internal State ---
-static char vol_str[8] = "--";
+static char vol_str[16] = "--";
 static int vol_muted = 0;
 static int init_status = 1;
 static pa_mainloop *ml = NULL;
 static pa_context *ctx = NULL;
-static const char *active_card = NULL;
+
+// Name of the sink we're currently attached to ("@DEFAULT_SINK@" if the
+// caller asked for the default). Owned buffer -- never a borrowed pointer
+// from the caller, since we have no guarantee on the caller's string
+// lifetime or on pointer stability across calls.
+static char active_card[64] = "";
+static int have_active_card = 0;
 
 #define OP_UNREF(op) do { pa_operation *_o = (op); if (_o) pa_operation_unref(_o); } while (0)
 
 // --- PulseAudio Callback Forward Declarations ---
 static void context_state_cb(pa_context *c, void *userdata);
+
+// Resolve a caller-supplied card name to what we'll actually request from
+// PulseAudio. NULL/empty means "default sink" -- PulseAudio wants an
+// explicit name for that, not NULL, so we spell it out.
+static const char *resolve_name(const char *card) {
+    return (card && *card) ? card : "@DEFAULT_SINK@";
+}
 
 // --- PulseAudio Context Management ---
 static void teardown(void) {
@@ -23,19 +36,29 @@ static void teardown(void) {
     pa_context_disconnect(ctx);
     pa_context_unref(ctx);
     ctx = NULL;
-    active_card = NULL;
+    have_active_card = 0;
+    active_card[0] = '\0';
 }
 
 static int connect_ctx(const char *card) {
     int ret;
+    const char *name = resolve_name(card);
+
     teardown();
     if (!ml && !(ml = pa_mainloop_new())) return -1;
     if (!(ctx = pa_context_new(pa_mainloop_get_api(ml), "slstatus"))) return -1;
+
     init_status = -1;
-    pa_context_set_state_callback(ctx, context_state_cb, (void *)card);
+
+    // Store our own copy of the name *before* connecting: the callbacks
+    // may fire (and read active_card) before connect_ctx() returns.
+    snprintf(active_card, sizeof(active_card), "%s", name);
+
+    pa_context_set_state_callback(ctx, context_state_cb, active_card);
     if (pa_context_connect(ctx, NULL, PA_CONTEXT_NOFLAGS, NULL) < 0) {
         pa_context_unref(ctx);
         ctx = NULL;
+        active_card[0] = '\0';
         return -1;
     }
     while (init_status < 0 && pa_mainloop_iterate(ml, 1, &ret) >= 0);
@@ -43,7 +66,7 @@ static int connect_ctx(const char *card) {
         teardown();
         return -1;
     }
-    active_card = card;
+    have_active_card = 1;
     return 0;
 }
 
@@ -81,25 +104,38 @@ static void context_state_cb(pa_context *c, void *userdata) {
 }
 
 // --- Data Preparation ---
-// Ensures the PulseAudio context is ready and processes events so that
-// vol_str and vol_muted are up-to-date. Returns <0 on error.
+// Ensures the PulseAudio context is ready and processes any pending
+// events so that vol_str and vol_muted are up-to-date. Returns <0 on
+// error.
 static int prepare_data(const char *card) {
     int ret, had_events = 0;
     pa_context_state_t s;
-    if (!ctx || card != active_card)
+    const char *name = resolve_name(card);
+
+    if (!ctx || !have_active_card || strcmp(name, active_card) != 0)
         return connect_ctx(card);
+
     s = pa_context_get_state(ctx);
     if (s == PA_CONTEXT_FAILED || s == PA_CONTEXT_TERMINATED)
         return connect_ctx(card);
-    // Drain any pending events (non-blocking)
+
+    // Drain whatever's already queued (non-blocking: returns immediately
+    // once the socket has nothing more buffered).
     while (pa_mainloop_iterate(ml, 0, &ret) > 0)
         had_events = 1;
-    // If events triggered async sink-info queries, poll briefly for reply
+
+    // Only block if something above actually kicked off an async
+    // get_sink_info request (see subscribe_cb) -- i.e. we know a reply is
+    // in flight. Blocking unconditionally would risk sitting on poll()
+    // forever when nothing is pending. This lets poll() sleep at the OS
+    // level (no CPU spent waiting, no arbitrary timeout guess) until that
+    // specific reply arrives.
     if (had_events) {
-        if (pa_mainloop_prepare(ml, 20000) >= 0 && pa_mainloop_poll(ml) >= 0)
-            pa_mainloop_dispatch(ml);
+        if (pa_mainloop_iterate(ml, 1, &ret) < 0)
+            return -1;
         while (pa_mainloop_iterate(ml, 0, &ret) > 0);
     }
+
     return 0;
 }
 
@@ -112,4 +148,14 @@ const char *vol_perc(const char *card) {
 // Returns "MUT" if muted, "VOL" if not, or NULL on error.
 const char *vol_mute(const char *card) {
     return prepare_data(card) < 0 ? NULL : (vol_muted ? "MUT" : "VOL");
+}
+
+// Releases all PulseAudio resources. Safe to call even if never connected.
+// Not required at process exit, but useful for clean shutdown / valgrind.
+void vol_cleanup(void) {
+    teardown();
+    if (ml) {
+        pa_mainloop_free(ml);
+        ml = NULL;
+    }
 }
