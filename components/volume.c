@@ -1,99 +1,22 @@
+/* See LICENSE file for copyright and license details. */
 #include <string.h>
+
 #include <pulse/pulseaudio.h>
 
 #include "../util.h"
 
-static unsigned vol_pct = 0;
-static int vol_muted = 0;
-static int init_status = 1;
-static pa_mainloop *ml = NULL;
+static pa_threaded_mainloop *mainloop = NULL;
 static pa_context *ctx = NULL;
-static char active_card[64] = "";
+static int running = 0;
 
-static void context_state_cb(pa_context *c, void *userdata);
-
-static const char *
-resolve_name(const char *card)
-{
-	return (card && *card) ? card : "@DEFAULT_SINK@";
-}
-
-static void
-unref(pa_operation *o)
-{
-	if (o)
-		pa_operation_unref(o);
-}
-
-static void
-teardown(void)
-{
-	if (!ctx)
-		return;
-	pa_context_set_state_callback(ctx, NULL, NULL);
-	pa_context_set_subscribe_callback(ctx, NULL, NULL);
-	pa_context_disconnect(ctx);
-	pa_context_unref(ctx);
-	ctx = NULL;
-	active_card[0] = '\0';
-}
+static int sink_muted = 0;
+static pa_volume_t sink_volume = PA_VOLUME_MUTED;
+static char sink_name[64] = "";
 
 static int
-connect_ctx(const char *card)
+is_default(const char *card)
 {
-	int ret;
-	const char *name = resolve_name(card);
-
-	teardown();
-	if (!ml && !(ml = pa_mainloop_new())) {
-		warn("vol_perc: unable to create pa_mainloop");
-		return -1;
-	}
-	if (!(ctx = pa_context_new(pa_mainloop_get_api(ml), "slstatus"))) {
-		warn("vol_perc: unable to create pa_context");
-		return -1;
-	}
-
-	init_status = -1;
-	esnprintf(active_card, sizeof(active_card), "%s", name); /* set before connect: callbacks may fire early */
-	pa_context_set_state_callback(ctx, context_state_cb, active_card);
-
-	if (pa_context_connect(ctx, NULL, PA_CONTEXT_NOFLAGS, NULL) < 0) {
-		warn("vol_perc: %s", pa_strerror(pa_context_errno(ctx)));
-		pa_context_unref(ctx);
-		ctx = NULL;
-		active_card[0] = '\0';
-		return -1;
-	}
-	while (init_status < 0 && pa_mainloop_iterate(ml, 1, &ret) >= 0)
-		;
-	if (init_status != 0) {
-		warn("vol_perc: %s", pa_strerror(pa_context_errno(ctx)));
-		teardown();
-		return -1;
-	}
-	return 0;
-}
-
-static void
-sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
-{
-	if (eol > 0 || !i) {
-		if (init_status < 0)
-			init_status = 1;
-		return;
-	}
-	vol_pct = 100 * pa_cvolume_avg(&i->volume) / PA_VOLUME_NORM;
-	vol_muted = i->mute;
-	if (init_status < 0)
-		init_status = 0;
-}
-
-static void
-subscribe_cb(pa_context *c, pa_subscription_event_type_t t, uint32_t idx, void *userdata)
-{
-	if ((t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK) == PA_SUBSCRIPTION_EVENT_SINK)
-		unref(pa_context_get_sink_info_by_name(c, userdata, sink_info_cb, NULL));
+	return !card || !*card || strcmp(card, "@DEFAULT_SINK@") == 0;
 }
 
 static void
@@ -101,72 +24,152 @@ context_state_cb(pa_context *c, void *userdata)
 {
 	switch (pa_context_get_state(c)) {
 	case PA_CONTEXT_READY:
-		pa_context_set_subscribe_callback(c, subscribe_cb, userdata);
-		unref(pa_context_subscribe(c, PA_SUBSCRIPTION_MASK_SINK, NULL, NULL));
-		unref(pa_context_get_sink_info_by_name(c, userdata, sink_info_cb, NULL));
-		break;
 	case PA_CONTEXT_FAILED:
 	case PA_CONTEXT_TERMINATED:
-		if (init_status < 0)
-			init_status = 1;
+		pa_threaded_mainloop_signal(mainloop, 0);
 		break;
 	default:
 		break;
 	}
 }
 
-/* connects, subscribes, and drains pending events so vol_pct/vol_muted are current */
-static int
-prepare_data(const char *card)
+/* resolves the default sink name */
+static void
+server_info_cb(pa_context *c, const pa_server_info *i, void *userdata)
 {
-	int ret, had_events = 0;
-	pa_context_state_t s;
-	const char *name = resolve_name(card);
+	if (i && i->default_sink_name)
+		esnprintf(sink_name, sizeof(sink_name), "%s", i->default_sink_name);
+	pa_threaded_mainloop_signal(mainloop, 0);
+}
 
-	if (!ctx || !active_card[0] || strcmp(name, active_card) != 0)
-		return connect_ctx(card);
+static void
+sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
+{
+	if (eol == 0 && i) {
+		sink_muted = i->mute;
+		sink_volume = pa_cvolume_avg(&i->volume);
+	}
+	pa_threaded_mainloop_signal(mainloop, 0);
+}
 
-	s = pa_context_get_state(ctx);
-	if (s == PA_CONTEXT_FAILED || s == PA_CONTEXT_TERMINATED)
-		return connect_ctx(card);
+static int
+connect_ctx(void)
+{
+	pa_context_state_t st;
 
-	while (pa_mainloop_iterate(ml, 0, &ret) > 0)
-		had_events = 1;
-
-	/* block only if a reply is actually in flight; poll() sleeps, no busy wait */
-	if (had_events) {
-		if (pa_mainloop_iterate(ml, 1, &ret) < 0) {
-			warn("vol_perc: %s", pa_strerror(pa_context_errno(ctx)));
+	if (!mainloop && !(mainloop = pa_threaded_mainloop_new())) {
+		warn("vol_perc: unable to create mainloop");
+		return -1;
+	}
+	if (!ctx) {
+		ctx = pa_context_new(pa_threaded_mainloop_get_api(mainloop), "slstatus");
+		if (!ctx) {
+			warn("vol_perc: unable to create context");
 			return -1;
 		}
-		while (pa_mainloop_iterate(ml, 0, &ret) > 0)
-			;
+		pa_context_set_state_callback(ctx, context_state_cb, NULL);
+	}
+	if (!running) {
+		if (pa_threaded_mainloop_start(mainloop) < 0) {
+			warn("vol_perc: unable to start mainloop");
+			return -1;
+		}
+		running = 1;
+	}
+
+	pa_threaded_mainloop_lock(mainloop);
+
+	st = pa_context_get_state(ctx);
+	if (st != PA_CONTEXT_READY) {
+		/* server restarted or connection dropped: reconnect from scratch */
+		if (st == PA_CONTEXT_FAILED || st == PA_CONTEXT_TERMINATED) {
+			pa_context_unref(ctx);
+			ctx = pa_context_new(pa_threaded_mainloop_get_api(mainloop), "slstatus");
+			pa_context_set_state_callback(ctx, context_state_cb, NULL);
+		}
+		if (pa_context_connect(ctx, NULL, PA_CONTEXT_NOFLAGS, NULL) < 0) {
+			warn("vol_perc: %s", pa_strerror(pa_context_errno(ctx)));
+			pa_threaded_mainloop_unlock(mainloop);
+			return -1;
+		}
+		while ((st = pa_context_get_state(ctx)) != PA_CONTEXT_READY &&
+		       st != PA_CONTEXT_FAILED && st != PA_CONTEXT_TERMINATED)
+			pa_threaded_mainloop_wait(mainloop);
+	}
+
+	pa_threaded_mainloop_unlock(mainloop);
+
+	if (st != PA_CONTEXT_READY) {
+		warn("vol_perc: %s", pa_strerror(pa_context_errno(ctx)));
+		return -1;
 	}
 	return 0;
+}
+
+static int
+query_sink(const char *card)
+{
+	pa_operation *o;
+	int r = -1;
+
+	pa_threaded_mainloop_lock(mainloop);
+
+	if (is_default(card)) {
+		/* resolve "@DEFAULT_SINK@" to a concrete sink name */
+		sink_name[0] = '\0';
+		o = pa_context_get_server_info(ctx, server_info_cb, NULL);
+		if (o) {
+			while (pa_operation_get_state(o) == PA_OPERATION_RUNNING)
+				pa_threaded_mainloop_wait(mainloop);
+			pa_operation_unref(o);
+		}
+		if (!sink_name[0]) {
+			pa_threaded_mainloop_unlock(mainloop);
+			return -1;
+		}
+	} else {
+		esnprintf(sink_name, sizeof(sink_name), "%s", card);
+	}
+
+	o = pa_context_get_sink_info_by_name(ctx, sink_name, sink_info_cb, NULL);
+	if (o) {
+		while (pa_operation_get_state(o) == PA_OPERATION_RUNNING)
+			pa_threaded_mainloop_wait(mainloop);
+		pa_operation_unref(o);
+		r = 0;
+	}
+
+	pa_threaded_mainloop_unlock(mainloop);
+	return r;
 }
 
 const char *
 vol_perc(const char *card)
 {
-	if (prepare_data(card) < 0)
+	if (connect_ctx() < 0 || query_sink(card) < 0)
 		return NULL;
-	return bprintf("%u", vol_pct);
+	return bprintf("%u", (unsigned)(100ULL * sink_volume / PA_VOLUME_NORM));
 }
 
 const char *
 vol_mute(const char *card)
 {
-	if (prepare_data(card) < 0)
+	if (connect_ctx() < 0 || query_sink(card) < 0)
 		return NULL;
-	return vol_muted ? "MUT" : "VOL";
+	return sink_muted ? "MUT" : "VOL";
 }
 
 void
 vol_cleanup(void)
 {
-	teardown();
-	if (ml) {
-		pa_mainloop_free(ml);
-		ml = NULL;
+	if (!mainloop)
+		return;
+	pa_threaded_mainloop_stop(mainloop);
+	if (ctx) {
+		pa_context_unref(ctx);
+		ctx = NULL;
 	}
+	pa_threaded_mainloop_free(mainloop);
+	mainloop = NULL;
+	running = 0;
 }
